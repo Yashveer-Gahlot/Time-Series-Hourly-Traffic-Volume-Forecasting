@@ -91,7 +91,7 @@ lags = 100
 ACF_PACF_Plot(traffic,lags,'Traffic Volume')
 
 # c. Correlation Matrix with seaborn heatmap and Pearson's correlation coefficient
-corr = data.corr()
+corr = data.select_dtypes(include=[np.number]).corr()
 plt.figure(figsize=(18,16))
 ax = sns.heatmap(corr,vmin=-1, vmax=1, center=0, cmap='YlOrRd_r',square=True,annot=True)
 bottom,top = ax.get_ylim()
@@ -241,11 +241,95 @@ X_train, X_test, Y_train, Y_test = train_test_split(X, Y, shuffle=False, test_si
 # Singular Values Analysis
 X_v = X.values
 H = np.matmul(X_v.T,X_v)
-s,d,v = np.linalg.svd(H)
+H_df = pd.DataFrame(H)      # works if H is ndarray, list of lists, or DataFrame
+
+# Try to coerce all entries to numeric; invalid -> NaN
+H_num = H_df.apply(pd.to_numeric, errors='coerce')
+
+# Report any problems (optional but useful)
+n_bad = H_num.isna().sum().sum()
+if n_bad > 0:
+    print(f"Warning: {n_bad} non-numeric/NaN entries found in H; first few locations:")
+    bad_locs = np.argwhere(H_num.isna().values)
+    for r,c in bad_locs[:10]:
+        print(f"  H[{r},{c}] raw -> {repr(H_df.iat[r,c])} (type={type(H_df.iat[r,c])})")
+    # Also show column-wise counts
+    print("NaNs per column:", H_num.isna().sum().to_dict())
+
+# If too many NaNs, raise a clear error so you can inspect upstream
+nan_frac = n_bad / (H_num.shape[0]*H_num.shape[1])
+if nan_frac > 0.3:
+    raise ValueError(f"Too many NaNs in H ({nan_frac:.2%}). Check how H is constructed upstream.")
+
+# Fill NaNs with column mean (preferred) or overall mean if column mean is NaN
+col_means = H_num.mean(axis=0)
+H_filled = H_num.fillna(col_means).fillna(H_num.stack().mean()).values.astype(float)
+
+# final sanity check
+if not np.isfinite(H_filled).all():
+    raise ValueError("H_filled contains non-finite values after filling. Inspect H_num.")
+
+# Now compute SVD
+s, d, v = np.linalg.svd(H_filled, full_matrices=False)
+print("SVD succeeded. singular values sample:", s[:6])
 print('The Singular Values of the raw dataset is\n',d)   # One of singular value close to zero means that one or more feature are correlated (co-llinearity exist).
 
 # Condition Number
-print('The condition number of the raw dataset is', LA.cond(X))    # The condition number is higher than 1000, which means severe degree of co-linearity exist.
+if not isinstance(X, pd.DataFrame):
+    try:
+        X = pd.DataFrame(X)
+    except Exception:
+        raise RuntimeError("X cannot be converted to DataFrame. Inspect its creation.")
+
+# 1) Show dtypes and non-numeric columns for debugging
+print("Column dtypes before conversion:\n", X.dtypes)
+non_numeric_cols = X.select_dtypes(exclude=[np.number]).columns.tolist()
+print("Non-numeric columns detected:", non_numeric_cols)
+
+# 2) If there are categorical/object columns, one-hot encode them (recommended)
+if len(non_numeric_cols) > 0:
+    # You can change drop_first=True if you want to avoid dummy trap
+    X = pd.get_dummies(X, columns=non_numeric_cols, drop_first=True)
+    print("After get_dummies, new columns count:", X.shape[1])
+
+# 3) Coerce all remaining values to numeric; invalid parsing -> NaN
+X_numeric = X.apply(pd.to_numeric, errors='coerce')
+
+# 4) Report NaNs and offending sample values (if any)
+n_nan = X_numeric.isna().sum().sum()
+if n_nan > 0:
+    print(f"Found {n_nan} NaN entries in X after coercion.")
+    # Show a few NaN locations and raw original values for debugging
+    nan_locs = np.argwhere(X_numeric.isna().values)
+    for r, c in nan_locs[:10]:
+        print(f"  NaN at row {r}, col {X_numeric.columns[c]} -> raw: {repr(X.iat[r, c])}")
+
+# 5) Fill NaNs with column means (preferred) or zero as fallback
+col_means = X_numeric.mean(axis=0)
+X_filled = X_numeric.fillna(col_means).fillna(0.0)
+
+# 6) Convert to float ndarray
+X_array = X_filled.values.astype(float)
+
+# 7) (Optional but recommended) scale features before computing condition number
+#    scaling helps because cond is scale-dependent; use both raw and scaled cond numbers.
+try:
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_array)
+except Exception:
+    X_scaled = X_array  # fallback if sklearn missing
+
+# 8) Compute and print condition numbers
+cond_raw = LA.cond(X_array)
+cond_scaled = LA.cond(X_scaled)
+print("Condition number (raw):", cond_raw)
+print("Condition number (scaled):", cond_scaled)
+
+# 9) Interpret quickly for you:
+if cond_scaled > 1e3:
+    print("Warning: scaled condition number > 1000 — indicates severe multicollinearity / numerical instability.")
+elif cond_scaled > 1e2:
+    print("Note: scaled condition number > 100 — moderate collinearity.")   # The condition number is higher than 1000, which means severe degree of co-linearity exist.
 print()
 
 # Estimate the regression model unknown coefficients by using OLS function
@@ -258,7 +342,69 @@ print()
 # 'snow_1h' feature has highest p-value in t-test, which means we fail to reject the null hypothesis. This coefficient is not significance.
 print("# ===== Remove 'snow_1h' feature =====")
 X_train.drop(['snow_1h'], axis=1, inplace=True)
-model_1 = sm.OLS(Y_train, X_train).fit()
+X_df = pd.DataFrame(X_train)
+Y_ser = pd.Series(Y_train).squeeze()   # keep as Series if possible
+
+print("Before conversion, X dtypes:\n", X_df.dtypes)
+print("Before conversion, Y dtype:", getattr(Y_ser, 'dtype', type(Y_ser)))
+
+# If there are non-numeric columns in X, one-hot encode them OR drop them.
+non_numeric = X_df.select_dtypes(exclude=[np.number]).columns.tolist()
+if non_numeric:
+    print("Non-numeric X columns detected:", non_numeric)
+    # Option A (recommended): encode categorical columns
+    X_df = pd.get_dummies(X_df, columns=non_numeric, drop_first=True)
+    print("After get_dummies, X columns:", X_df.shape[1])
+
+# Coerce all to numeric: non-convertible -> NaN
+X_num = X_df.apply(pd.to_numeric, errors='coerce')
+Y_num = pd.to_numeric(Y_ser, errors='coerce')
+
+# Show if any NaNs introduced
+n_nan_X = X_num.isna().sum().sum()
+n_nan_Y = Y_num.isna().sum()
+print(f"NaNs after coercion - X: {n_nan_X}, Y: {n_nan_Y}")
+
+# If NaNs present, inspect a few examples (optional)
+if n_nan_X > 0 or n_nan_Y > 0:
+    print("Sample rows with NaNs in X (first 10):")
+    print(X_num[X_num.isna().any(axis=1)].head(10))
+    print("Sample Y NaNs indices:", np.where(Y_num.isna())[0][:10])
+
+# Align indices: ensure same index for X and Y
+# If X_num/Y_num lost original index, reset to numeric index for safe alignment
+X_num = X_num.reset_index(drop=True)
+Y_num = Y_num.reset_index(drop=True)
+
+# Combine to drop rows where either X or Y has NaN
+combined = pd.concat([Y_num, X_num], axis=1)
+combined_clean = combined.dropna(axis=0)   # drops rows with any NaN
+
+# If you prefer imputation instead of dropping, replace previous line with:
+# combined_clean = combined.fillna(combined.mean())
+
+# Separate back
+Y_clean = combined_clean.iloc[:, 0]
+X_clean = combined_clean.iloc[:, 1:]
+
+# Add constant (intercept) if desired
+if 'const' not in X_clean.columns:
+    X_clean = sm.add_constant(X_clean, has_constant='add')
+
+# Final dtype check
+print("Final X_clean dtypes:\n", X_clean.dtypes)
+print("Final Y_clean dtype:", Y_clean.dtype)
+print("Shapes -> X:", X_clean.shape, "Y:", Y_clean.shape)
+
+# Convert to numpy arrays of float
+X_for_model = X_clean.values.astype(float)
+Y_for_model = Y_clean.values.astype(float)
+
+# Fit the model
+model = sm.OLS(Y_for_model, X_for_model).fit()
+
+# Print summary
+print(model.summary())
 print(model_1.summary())
 print()
 # After 'snow_1h' features has been removed, the AIC, BIC, and Adj. R-squared do not change.
